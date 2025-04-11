@@ -115,7 +115,7 @@ def main():
             # 環境変数 CUDA_VISIBLE_DEVICES で使用GPUを制限
             cuda_visible = ",".join(str(gid) for gid in gpu_ids_for_group)
 
-            out_file = f"temp_output_{i}.jsonl"
+            out_file = f"gen_temp_output_{i}.jsonl"
             temp_files.append(out_file)
 
             cmd = [
@@ -196,5 +196,5 @@ if __name__ == "__main__":
     main()
 
 """
-python auto_run.py --num_gpus 7 --main_script main.py --num_prompts 100000 --output_file my_output.jsonl
+python auto_run.py --num_gpus 7 --main_script main.py --num_prompts 100 --output_file my_output.jsonl
 """

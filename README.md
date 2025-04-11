@@ -1,63 +1,91 @@
-# zero_one_instruction  — vLLMを用いたSFTデータ生成ツール
+# Zero-One Instruction プロジェクト
+
+大規模言語モデル（LLM）を活用して高品質な学習データ（質問と回答のペア）を自動生成するフレームワークです。このシステムは、シンプルなシードプロンプトから始めて、複数の変換ステップを経て、高品質な指示-応答ペアを生成します。
 
 ## 概要
 
-このツールは、[vLLM](https://github.com/vllm-project/vllm)を利用して、マルチステップのプロンプト進化プロセスを経て、Supervised Fine-Tuning（SFT）用の高品質なデータセット（質問と回答のペア）を自動生成します。
+このプロジェクトは、基本的なシードプロンプトから複雑で多様なプロンプトを生成し、それに対応する回答を作成することで、自己教師あり学習（SFT）データを効率的に生成することを目的としています。生成プロセスは品質評価ステップを含み、低品質のプロンプトを排除または修正します。
 
-設定ファイル（`model_config.yml`）により、使用する言語モデルや推論パラメータを柔軟に変更できます。
+## 特徴
 
-## 機能
+- **複数段階の変換プロセス**: 基本プロンプトから高品質な質問-回答ペアへと段階的に変換
+- **品質フィルタリング**: 品質の低いプロンプトを検出・排除または修正
+- **バッチ処理**: 効率的な大量データ生成のためのバッチ処理をサポート
+- **マルチGPU対応**: 複数GPUを活用した並列処理により処理速度を向上
+- **逐次JSONLファイル出力**: 生成データをJSONL形式で逐次出力し、大規模な生成にも対応
 
-- **プロンプト進化:**
-  - **Width:** 元のプロンプトを基に、同じテーマでよりユニークな新しいプロンプトを生成します。
-  - **Depth:** 生成されたプロンプトに新たな制約や要件を追加し、より複雑で深みのある指示に書き換えます。
-  - **Flatten:** プロンプトを理路整然とした質問形式に修正し、誤字脱字や曖昧さを解消します。
-- **品質判定（Judge）:** 生成されたプロンプトが自然な日本語で、明確な意図を持ち、安全かつAIが回答可能な範囲内にあるかを判定します。
-- **回答生成:** 進化・判定を経た最終的なプロンプトに対して、指定されたモデルが回答を生成します。
-- **バッチ処理:** 複数のベースプロンプトをまとめて処理し、効率的にデータセットを生成します。
-- **設定ファイル:** `model_config.yml`でモデル、量子化、GPU設定、バッチサイズなどを一元管理します。
+## 必要環境
 
-## 動作環境
+```
+vllm==0.8.3
+transformers==4.51.0
+datasets==3.5.0
+```
 
-- Python 3.8以上（推奨）
-- NVIDIA GPU（vLLMの実行に必須）
-- 必要なPythonライブラリ（詳細は`requirements.txt`を参照）
-  - `vllm`
-  - `transformers`
+## システム構成
 
-## インストール方法
+プロジェクトは以下のコンポーネントで構成されています：
 
-1. **リポジトリのクローン:**
-    ```bash
-    git clone <repository_url>
-    cd <repository_directory>
-    ```
+- `main.py`: メインの処理フローを実行するスクリプト
+- `gen_seed.py`: シードプロンプトを生成するモジュール
+- `vllm_inf.py`: vLLMによるバッチ推論を行うクラス
+- `model_config.yml`: モデル設定ファイル
+- `auto_run.py`: 複数GPUでの並列実行を管理するスクリプト
 
-2. **Python仮想環境の作成と有効化（推奨）:**
-    ```bash
-    python -m venv venv
-    source venv/bin/activate  # Linux/macOSの場合
-    # venv\Scripts\activate  # Windowsの場合
-    ```
+## データ生成フロー
 
-3. **依存ライブラリのインストール:**
-    ```bash
-    pip install -r requirements.txt
-    ```
-    **注意:** vLLMのインストールには時間がかかることがあり、環境によっては追加の依存関係が必要です。詳細は[vLLM公式ドキュメント](https://docs.vllm.ai/en/latest/getting_started/installation.html)を参照してください。
+シードプロンプトから質の高い指示-応答ペアを生成するプロセスは、以下のステップで構成されています：
 
-## 設定
+1. **シード生成**: `gen_seed.py`が基本となるシードプロンプトを生成
+2. **プロンプト拡張（evol_width）**: シードプロンプトから新しい視点を含むプロンプトを生成
+3. **品質判定（evol_judge）**: 生成したプロンプトの品質を評価
+4. **プロンプト修正（FIXER）**: 低品質と判断されたプロンプトを修正
+5. **複雑化（evol_depth）**: プロンプトに複雑さや深みを追加
+6. **標準化（evol_flatten）**: プロンプトを整形し標準化
+7. **最終品質判定**: 再度品質を評価
+8. **回答生成**: 高品質なプロンプトに対して回答を生成
+9. **JSONLファイル出力**: 生成された質問-回答ペアをJSONL形式で保存
 
-実行前に`model_config.yml`を編集して、環境や目的に合わせて設定を調整してください。
+## 使用方法
 
-設定例:
+### 基本的な使用法（単一プロセス）
+
+```bash
+python main.py --start_idx 0 --end_idx 100 --output_file output.jsonl
+```
+
+### 複数GPUでの並列実行
+
+```bash
+python auto_run.py --num_prompts 1000 --output_file combined_output.jsonl
+```
+
+### コマンドラインオプション（main.py）
+
+- `--start_idx`: 処理を開始するシードプロンプトのインデックス
+- `--end_idx`: 処理を終了するシードプロンプトのインデックス
+- `--output_file`: 出力JSONLファイルのパス
+- `--id_start`: 出力レコードIDの開始番号（デフォルト: 0）
+- `--config_path`: モデル設定ファイルのパス（デフォルト: "model_config.yml"）
+
+### コマンドラインオプション（auto_run.py）
+
+- `--num_prompts`: 生成するベースプロンプトの総数
+- `--output_file`: 最終出力ファイルのパス
+- `--main_script`: 実行するメインスクリプトのパス（デフォルト: "main.py"）
+- `--num_gpus`: 使用するGPU数（デフォルト: 利用可能な全GPU）
+
+## モデル設定
+
+`model_config.yml`でモデルの各種パラメータを設定できます：
+
 ```yaml
 model_name: "OPEA/Mistral-Small-3.1-24B-Instruct-2503-int4-AutoRound-awq-sym"
-quantization: "awq"  # 不要ならnullを指定
+quantization: "awq"
 gpu_memory_utilization: 0.7
-tensor_parallel_size: null  # 自動設定はnull
+tensor_parallel_size: null  # nullにすると自動でGPU枚数に合わせる
 batch_size: 32
-max_tokens: 512
+max_tokens: 2048
 max_model_len: 4096
 trust_remote_code: True
 dtype: "auto"
@@ -65,75 +93,34 @@ temperature: 0.9
 top_p: 0.9
 ```
 
-各項目の詳細は元の説明を参照してください。
+## 出力データ形式
 
-## 使い方
+生成されるデータはJSONL形式で、各レコードは以下の構造を持ちます：
 
-SFTデータ生成プロセスは、単一プロセスでの`main.py`実行、または複数のGPUを利用するためのラッパースクリプト`auto_run.py`を使用して開始します。
-
-### 1. `main.py`を直接実行（単一プロセス）
-
-```bash
-python main.py --start_idx <開始インデックス> --end_idx <終了インデックス> --output_file <出力ファイル名> [オプション]
-```
-
-コマンドライン引数についての詳細は元の説明を参照してください。
-
-### 実行例
-
-- インデックス0〜99を処理する場合:
-```bash
-python main.py --start_idx 0 --end_idx 100 --output_file output.jsonl
-```
-
-- インデックス100〜199を処理し、IDを100から開始する場合:
-```bash
-python main.py --start_idx 100 --end_idx 200 --output_file output_part2.jsonl --id_start 100
-```
-
-### 2. `auto_run.py`を使用（マルチGPU並列実行）
-
-`auto_run.py`は、複数GPU環境で効率的に`main.py`を並列実行するためのラッパースクリプトです。
-
-```bash
-python auto_run.py --num_prompts <総プロンプト数> --output_file <最終出力ファイル名> [オプション]
-```
-
-コマンドライン引数および動作の詳細は元の説明を参照してください。
-
-### 実行例
-
-- 利用可能な全GPUで10万プロンプトを処理する場合:
-```bash
-python auto_run.py --num_prompts 100000 --output_file my_output.jsonl
-```
-
-- GPU数を7個指定する場合（4, 2, 1のGPUグループに分割されます）:
-```bash
-python auto_run.py --num_gpus 7 --num_prompts 100000 --output_file my_output.jsonl
-```
-
-## 出力形式
-
-指定した`--output_file`にJSONL形式で出力されます。
-
-出力例:
 ```json
 {
-  "id": "record_0",
-  "input": "最終的に生成された質問プロンプト",
-  "output": "モデルが生成した回答",
+  "id": "record_XXX",
+  "input": "生成されたプロンプト",
+  "output": "生成された回答",
   "conversation": [
-    {"from": "system", "value": "あなたは優秀な日本語AIアシスタントです。ユーザーの質問に対して正確かつ簡潔に回答します。"},
-    {"from": "human", "value": "最終的に生成された質問プロンプト"},
-    {"from": "gpt", "value": "モデルが生成した回答"}
+    {"from": "system", "value": "あなたは優秀な日本語AIアシスタントです。ユーザーの質問に対して、正確かつ簡潔な回答を行います。"},
+    {"from": "human", "value": "生成されたプロンプト"},
+    {"from": "gpt", "value": "生成された回答"}
   ]
 }
 ```
 
-## 注意点
+## GPUリソース管理
 
-- **GPU要件:** vLLMはNVIDIA GPUが必須です。必要メモリ量はモデルサイズによります。
-- **ベースプロンプト:** 実際のユースケースに合わせて、`main.py`内のベースプロンプトを編集してください。
-- **プロンプトテンプレート:** 各プロンプト進化ステップ用のテンプレート（`PROMPT_EVOL_WIDTH`等）は、必要に応じてカスタマイズ可能です。
-- **エラーハンドリング:** 推論エラー時の出力は`"<GEN_ERROR>"`となり、後続の処理から除外されます。また、品質基準を満たさないプロンプトも最終出力から除外されます。
+`auto_run.py`は利用可能なGPUリソースを効率的に管理します：
+
+- GPU数が2の冪（2, 4, 8, 16など）の場合、単一プロセスで処理
+- GPU数が2の冪でない場合（例：3, 5, 7）、2の冪の和に分割して並列処理（例：7 = 4+2+1）
+- 各GPU群にデータを分割し、プロセスごとに指定されたGPUを割り当てて並列実行
+- 結果を自動的に統合して最終出力を生成
+
+## 注意事項
+
+- 大規模なデータ生成を行う場合、十分なディスク容量を確保してください
+- モデル読み込みに必要なGPUメモリ量を考慮し、適切なquantizationを設定してください
+- 処理性能は、使用するGPUの性能やモデルのサイズによって大きく変わります

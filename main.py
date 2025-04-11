@@ -8,23 +8,29 @@ from tqdm import tqdm
 # ===== vLLM関係のラッパクラスをインポート =====
 from vllm_inf import VllmBatchInference
 
+# ===== seed_prompts.py からプロンプトをインポート =====
+from gen_seed import gen_seed
+
 # =====================================
-#  ステップごとのプロンプトテンプレート (例)
+#  ステップごとのプロンプトテンプレート
 # =====================================
 PROMPT_EVOL_WIDTH = """\
-あなたは「高度に安全かつ有用なAIプロンプト」を作成する専門家です。
-以下の #Given Prompt# を下敷きにしつつ、まったく新しいプロンプト (#Created Prompt#) を構成してください。
-ただし、次の条件を厳守してください。
+あなたは「高度に安全かつ有用なAIプロンプト」を生み出す専門家です。
+次の #Given Prompt# をベースに、新たな視点を取り入れた全く別の質問プロンプト(#Created Prompt#)を一つ作成してください。
+作成する質問プロンプトは優秀な人間が書くようなプロンプトにして下さい。テーマとタスクに言及する必要はありません。
+テーマとジャンルを元にして「優秀な人間が質問するならばAIにこう質問するだろう」と思うようなものを質問プロンプトとして作成してください。
 
-1. 同じジャンル・テーマを保ちつつ、よりユニークで独創的な視点を加える。
-2. 長さや難易度は #Given Prompt# と同程度とし、文が破綻しないように注意する。
-3. テキスト処理のみ可能なAIが回答できる範囲の内容に留める（外部APIや外部情報への依存は排除する）。
-4. 公序良俗に反する指示や差別、誹謗中傷を含む指示にならないようにする。
+【注意事項】
+1. テーマやジャンルは同じままにしつつ、独特な視点やアイデアを加えること
+2. 長さと難易度は #Given Prompt# と同等に保つこと
+3. 回答は外部APIや外部情報を参照せず、テキスト処理だけで完結できる範囲に限定する
+4. 公序良俗や利用規約に反しない内容にする
+5. 無用な先入観・偏見を避け、公平な表現を心がける
 
 #Given Prompt#:
 {original_prompt}
 
-#Created Prompt#:(作成した新しいプロンプトのみを回答してください)
+#Created Prompt#:
 """
 
 PROMPT_EVOL_JUDGE = """\
@@ -83,6 +89,24 @@ PROMPT_RESPONSE = """\
 回答（または「不可能」）:
 """
 
+# ---------------------------
+# 新たに追加する修正用プロンプト
+# ---------------------------
+PROMPT_FIXER = """\
+あなたはプロンプト修正専門AIです。
+以下のプロンプトは質の低い、不適切と判断されたため、修正する必要があります。
+
+修正にあたっては次の点を考慮してください。
+1. 公序良俗および利用規約違反の表現を除去し、安全な内容に書き換える。
+2. 質問としての体裁が破綻しないよう再構成し、可能な限り元のテーマを維持する。
+3. テキストのみで回答可能な範囲に収め、外部APIや不確定情報への依存を排除する。
+
+元の不適切プロンプト:
+{failed_prompt}
+
+#Fixed Prompt#:
+"""
+
 def load_config(config_path: str = "model_config.yml") -> Dict:
     """
     model_config.yml を読み込んで辞書型にして返す簡単なヘルパー関数。
@@ -90,165 +114,207 @@ def load_config(config_path: str = "model_config.yml") -> Dict:
     with open(config_path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
 
+
 def run_sft_flow_batch(
     vllm_infer: VllmBatchInference,
     base_prompts: List[str],
+    output_filepath: str,  # <<< 変更点: 出力ファイルパスを引数に追加
     evol_depth_steps: int = 1,
     record_offset: int = 0
-) -> List[Dict]:
+) -> int: # <<< 変更点: 戻り値を生成レコード数(int)に変更
     """
-    マルチステップのSFTフローをまとめて実行し、
-    有効なデータ(質問と回答のペア)のみ抽出して返す。
+    改良版のマルチステップSFTフローをバッチ処理で実行し、
+    有効なデータ(質問と回答のペア)を **逐次JSONLファイルに書き出す**。
 
     Args:
         vllm_infer (VllmBatchInference) : vLLM推論オブジェクト
         base_prompts (List[str])        : 元となるプロンプトのリスト
+        output_filepath (str)           : 結果を書き出すJSONLファイルパス
         evol_depth_steps (int)          : evol_depth の適用回数
         record_offset (int)             : 生成されるレコードIDの開始オフセット
 
     Returns:
-        List[Dict]: 成功した (質問,回答) のレコードリスト
-                    各要素に "id", "input", "output", "conversation" が含まれる
+        int: 生成されたレコードの総数
     """
-    # 同じ長さのブールリストを用意し、途中で失敗したものはFalseにする
-    keep_mask = [True] * len(base_prompts)
 
-    # =====================================================
-    # 1. evol_width
-    # =====================================================
-    width_input = [
-        PROMPT_EVOL_WIDTH.format(original_prompt=bp)
-        for bp in base_prompts
-    ]
-    width_output = vllm_infer.generate_batch_custom(width_input)
-    evol_prompts = ["" for _ in base_prompts]
+    batch_size = vllm_infer.batch_size
+    if batch_size is None:
+        batch_size = 32
 
-    for i, ans in enumerate(width_output):
-        ans_s = ans.strip()
-        if not ans_s or "<GEN_ERROR>" in ans_s:
-            keep_mask[i] = False
-        else:
-            evol_prompts[i] = ans_s
+    # バッファ
+    discard_buf_1 = []
+    pass_buf = []
+    discard_buf_2 = []
 
-    # =====================================================
-    # 2. evol_judge ("はい"/"いいえ")
-    # =====================================================
-    judge_input = [
-        PROMPT_EVOL_JUDGE.format(prompt=p) if alive else ""
-        for p, alive in zip(evol_prompts, keep_mask)
-    ]
-    judge_output = vllm_infer.generate_batch_custom(judge_input)
-    for i, jans in enumerate(judge_output):
-        if keep_mask[i]:
-            # 「はい」で始まる場合だけ存続
-            if not jans.strip().startswith("はい"):
-                keep_mask[i] = False
+    # ID用カウンタ と 生成レコード数カウンタ
+    current_id = record_offset
+    generated_count = 0 # <<< 変更点: 生成レコード数をカウント
 
-    # =====================================================
-    # 3. evol_depth (指定回数)
-    # =====================================================
-    for step_idx in range(evol_depth_steps):
-        depth_input = [
-            PROMPT_EVOL_DEPTH.format(prompt=p) if alive else ""
-            for p, alive in zip(evol_prompts, keep_mask)
+    # ----------------------------------------------------------------
+    # 1) Step1(evol_width) → Step2(evol_judge(1)) を
+    #    base_prompts からバッチ単位で繰り返す
+    # ----------------------------------------------------------------
+    total_prompts = len(base_prompts)
+    num_full_batches = total_prompts // batch_size
+
+    # tqdmを使って進捗を表示
+    pbar = tqdm(total=num_full_batches, desc="Processing Base Prompt Batches")
+
+    for batch_idx in range(num_full_batches):
+        start_i = batch_idx * batch_size
+        end_i = start_i + batch_size
+        sub_prompts = base_prompts[start_i:end_i]
+
+        # ---------- Step1: evol_width ----------
+        width_inputs = [
+            PROMPT_EVOL_WIDTH.format(original_prompt=p)
+            for p in sub_prompts
         ]
-        depth_output = vllm_infer.generate_batch_custom(depth_input)
-        for i, ans in enumerate(depth_output):
-            if keep_mask[i]:
-                ans_s = ans.strip()
-                if not ans_s or "<GEN_ERROR>" in ans_s:
-                    keep_mask[i] = False
+        width_outputs = vllm_infer.generate_batch_custom(width_inputs)
+
+        # ---------- Step2: evol_judge(1) ----------
+        candidates = []
+        judge_inputs = []
+        for wout in width_outputs:
+            if (not wout.strip()) or ("<GEN_ERROR>" in wout):
+                discard_buf_1.append("")
+            else:
+                judge_inputs.append(wout.strip())
+
+        if len(judge_inputs) > 0:
+            judge_outputs = vllm_infer.generate_batch_custom(
+                [PROMPT_EVOL_JUDGE.format(prompt=x) for x in judge_inputs]
+            )
+
+            for w_prompt, j_out in zip(judge_inputs, judge_outputs):
+                if j_out.strip().startswith("はい"):
+                    candidates.append(w_prompt)
                 else:
-                    evol_prompts[i] = ans_s
+                    discard_buf_1.append(w_prompt)
 
-    # =====================================================
-    # 4. evol_flatten
-    # =====================================================
-    flat_input = [
-        PROMPT_EVOL_FLATTEN.format(prompt=p) if alive else ""
-        for p, alive in zip(evol_prompts, keep_mask)
-    ]
-    flat_output = vllm_infer.generate_batch_custom(flat_input)
-    for i, ans in enumerate(flat_output):
-        if keep_mask[i]:
-            ans_s = ans.strip()
-            if not ans_s or "<GEN_ERROR>" in ans_s:
-                keep_mask[i] = False
-            else:
-                evol_prompts[i] = ans_s
+        pass_buf.extend(candidates)
 
-    # =====================================================
-    # 5. evol_judge (2回目)
-    # =====================================================
-    judge_input2 = [
-        PROMPT_EVOL_JUDGE.format(prompt=p) if alive else ""
-        for p, alive in zip(evol_prompts, keep_mask)
-    ]
-    judge_output2 = vllm_infer.generate_batch_custom(judge_input2)
-    for i, jans in enumerate(judge_output2):
-        if keep_mask[i]:
-            if not jans.strip().startswith("はい"):
-                keep_mask[i] = False
+        # ------------------------------------------------------
+        # Discard #1 がバッチサイズ分溜まったら修正フロー実行
+        # ------------------------------------------------------
+        if len(discard_buf_1) >= batch_size:
+            fix_targets = discard_buf_1[:batch_size]
+            discard_buf_1 = discard_buf_1[batch_size:]
 
-    # ===== 質問が確定 =====
-    final_questions = [
-        evol_prompts[i] if keep_mask[i] else ""
-        for i in range(len(evol_prompts))
-    ]
+            fixer_inputs = [
+                PROMPT_FIXER.format(failed_prompt=ft)
+                for ft in fix_targets
+            ]
+            fix_outputs = vllm_infer.generate_batch_custom(fixer_inputs)
 
-    # =====================================================
-    # 6. 回答生成 (PROMPT_RESPONSE)
-    # =====================================================
-    resp_input = [
-        PROMPT_RESPONSE.format(prompt=q) if alive else ""
-        for q, alive in zip(final_questions, keep_mask)
-    ]
-    resp_output = vllm_infer.generate_batch_custom(resp_input)
+            rejudge_inputs = []
+            fix_mapping = []
+            for i, f_out in enumerate(fix_outputs):
+                if (not f_out.strip()) or ("<GEN_ERROR>" in f_out):
+                    continue
+                rejudge_inputs.append(f_out.strip())
+                fix_mapping.append((i, f_out.strip()))
 
-    # 回答が「不可能」や極端に短い場合は除外
-    final_answers = ["" for _ in range(len(final_questions))]
-    for i, ans in enumerate(resp_output):
-        if keep_mask[i]:
-            ans_s = ans.strip()
-            if ("不可能" in ans_s) or (len(ans_s) < 10):
-                keep_mask[i] = False
-            else:
-                final_answers[i] = ans_s
+            if len(rejudge_inputs) > 0:
+                rejudge_outputs = vllm_infer.generate_batch_custom(
+                    [PROMPT_EVOL_JUDGE.format(prompt=x) for x in rejudge_inputs]
+                )
 
-    # =====================================================
-    # 失敗を除外しつつレコード化
-    # =====================================================
-    output_records = []
-    for i, alive in enumerate(keep_mask):
-        if not alive:
-            continue
-        q = final_questions[i]
-        a = final_answers[i]
+                for (map_idx, prompt_val), j_out in zip(fix_mapping, rejudge_outputs):
+                    if j_out.strip().startswith("はい"):
+                        pass_buf.append(prompt_val)
+                    else:
+                        pass
 
-        conversation = [
-            {"from": "system", "value": "あなたは優秀な日本語AIアシスタントです。ユーザーの質問に対して、正確かつ簡潔な回答を行います。"},
-            {"from": "human",  "value": q},
-            {"from": "gpt",    "value": a}
-        ]
-        # ★IDを record_offset + i でユニークに付与★
-        rec_id = record_offset + i
+        # ----------------------------------------------------------------
+        # pass_buf がバッチサイズに達したら Step3~6 を実施
+        # ----------------------------------------------------------------
+        while len(pass_buf) >= batch_size:
+            target_prompts = pass_buf[:batch_size]
+            pass_buf = pass_buf[batch_size:]
 
-        rec = {
-            "id": f"record_{rec_id}",
-            "input": q,
-            "output": a,
-            "conversation": conversation
-        }
-        output_records.append(rec)
+            # Step3: evol_depth (N回)
+            current_list = target_prompts
+            for _ in range(evol_depth_steps):
+                depth_inputs = [PROMPT_EVOL_DEPTH.format(prompt=p) for p in current_list]
+                depth_outputs = vllm_infer.generate_batch_custom(depth_inputs)
+                next_list = []
+                for d_out in depth_outputs:
+                    d_str = d_out.strip()
+                    if d_str and "<GEN_ERROR>" not in d_str:
+                        next_list.append(d_str)
+                current_list = next_list
+                if len(current_list) == 0:
+                    break
 
-    return output_records
+            # Step4: evol_flatten
+            if len(current_list) > 0:
+                flat_inputs = [PROMPT_EVOL_FLATTEN.format(prompt=p) for p in current_list]
+                flat_outputs = vllm_infer.generate_batch_custom(flat_inputs)
+                next_list = []
+                for f_out in flat_outputs:
+                    f_str = f_out.strip()
+                    if f_str and "<GEN_ERROR>" not in f_str:
+                        next_list.append(f_str)
+                current_list = next_list
+
+            # Step5: evol_judge(2)
+            if len(current_list) > 0:
+                judge2_inputs = [PROMPT_EVOL_JUDGE.format(prompt=p) for p in current_list]
+                judge2_outputs = vllm_infer.generate_batch_custom(judge2_inputs)
+                new_candidates = []
+                for p_val, j2_out in zip(current_list, judge2_outputs):
+                    if j2_out.strip().startswith("はい"):
+                        new_candidates.append(p_val)
+                    else:
+                        discard_buf_2.append(p_val)
+                current_list = new_candidates
+
+            # Step6: response gen (PROMPT_RESPONSE)
+            if len(current_list) > 0:
+                resp_inputs = [PROMPT_RESPONSE.format(prompt=x) for x in current_list]
+                resp_outputs = vllm_infer.generate_batch_custom(resp_inputs)
+
+                # <<< 変更点: ここでファイルに追記する >>>
+                with open(output_filepath, "a", encoding="utf-8") as f_out:
+                    for q_val, ans_val in zip(current_list, resp_outputs):
+                        ans_str = ans_val.strip()
+                        if ("不可能" in ans_str) or (len(ans_str) < 10):
+                            discard_buf_2.append(q_val)
+                        else:
+                            # OK => レコード化してファイルに書き出す
+                            conversation = [
+                                {"from": "system", "value": "あなたは優秀な日本語AIアシスタントです。ユーザーの質問に対して、正確かつ簡潔な回答を行います。"},
+                                {"from": "human", "value": q_val},
+                                {"from": "gpt", "value": ans_str}
+                            ]
+                            rec = {
+                                "id": f"record_{current_id}",
+                                "input": q_val,
+                                "output": ans_str,
+                                "conversation": conversation
+                            }
+                            # ファイルにJSONL形式で追記
+                            f_out.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                            current_id += 1
+                            generated_count += 1 # 生成数をカウントアップ
+
+        # tqdmの進捗を更新
+        pbar.update(1)
+        pbar.set_postfix({"Generated": generated_count}) # 生成数を表示
+
+    pbar.close()
+    # 余りの base_prompts は処理せず終了
+    # discard_buf_1 や pass_buf, discard_buf_2 の中身もバッチサイズ未満なら処理せず終了
+
+    return generated_count # <<< 変更点: 生成レコード数を返す
 
 
 def main():
     """
     メインエントリーポイント。
     コマンドライン引数で受け取った start_idx, end_idx に応じて
-    一連のマルチステップSFTフローをバッチ単位で実行し、結果をJSONLに出力します。
+    一連のマルチステップSFTフローをバッチ単位で実行し、結果を **逐次JSONLに出力** します。
     """
     parser = argparse.ArgumentParser()
     parser.add_argument('--start_idx', type=int, required=True, help='ベースプロンプト開始インデックス (inclusive)')
@@ -272,42 +338,43 @@ def main():
         dtype=config["dtype"],
         temperature=config["temperature"],
         top_p=config["top_p"],
+        batch_size=config["batch_size"],
         tensor_parallel_size=config["tensor_parallel_size"]
     )
+    vllm_infer.batch_size = config["batch_size"]
 
-    # 3. start_idx ~ end_idx-1 の範囲で、サンプルのベースプロンプト群を用意
-    base_prompts_all = [
-        f"これはサンプルの下地プロンプト {i} です。"
-        for i in range(args.end_idx)
-    ]
+    # 3. ベースプロンプトを生成
+    #   大量に生成される可能性があるため、必要な範囲だけ読み込むように変更
+    #   (gen_seed の実装が不明なため、ここでは一旦全量読み込む想定のままにする)
+    print(f"Generating base prompts up to index {args.end_idx}...")
+    base_prompts_all = gen_seed(int(args.end_idx))
+    print(f"Total base prompts generated: {len(base_prompts_all)}")
 
-    # バッチサイズも設定ファイルから読み込む
-    batch_size = config["batch_size"]
+    # 対象範囲のプロンプトを取得
+    prompts_to_process = base_prompts_all[args.start_idx:args.end_idx]
+    if not prompts_to_process:
+        print("No prompts to process in the specified range.")
+        return
 
-    # 4. バッチ単位でSFTフローを回し、結果をJSONLに追記
-    with open(args.output_file, "w", encoding="utf-8") as f_out:
-        for idx in range(args.start_idx, args.end_idx, batch_size):
-            batch_end = min(idx + batch_size, args.end_idx)
-            batch_prompts = base_prompts_all[idx:batch_end]
+    print(f"Processing prompts from index {args.start_idx} to {args.end_idx-1}")
 
-            print(f"\n[INFO] バッチ {idx} ~ {batch_end - 1} を処理中...")
-            final_data = run_sft_flow_batch(
-                vllm_infer,
-                batch_prompts,
-                evol_depth_steps=1,  # depthを増やしたければ変更可
-                record_offset=args.id_start + idx  # IDの開始位置を指定
-            )
+    # 4. バッチ単位でSFTフローを回し、結果をJSONLに **逐次** 出力
+    generated_count = run_sft_flow_batch( # <<< 変更点: 戻り値を受け取る
+        vllm_infer,
+        prompts_to_process,
+        output_filepath=args.output_file, # <<< 変更点: ファイルパスを渡す
+        evol_depth_steps=1,
+        record_offset=args.id_start
+    )
 
-            for record in final_data:
-                f_out.write(json.dumps(record, ensure_ascii=False) + "\n")
+    # 5. 成果をファイルに書き出し <<< 変更点: このブロックは不要になったため削除 >>>
+    # with open(args.output_file, "w", encoding="utf-8") as f_out:
+    #     for record in final_data:
+    #         f_out.write(json.dumps(record, ensure_ascii=False) + "\n")
 
-            print(f"[INFO] => 生成完了: {len(final_data)} 件を追記しました。")
-
-    print(f"[DONE] 全バッチ処理が終了しました。 出力先: {args.output_file}")
+    print(f"\n[DONE] 全バッチ処理が終了しました。出力先: {args.output_file}")
+    print(f" - 生成レコード数: {generated_count}") # <<< 変更点: 戻り値を使って表示
 
 
 if __name__ == "__main__":
     main()
-
-## 実行コマンド
-# python main.py --start_idx 0 --end_idx 100 --output_file output.jsonl

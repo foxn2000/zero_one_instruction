@@ -19,6 +19,7 @@ class VllmBatchInference:
                  max_model_len: int,
                  trust_remote_code: bool,
                  dtype: str,
+                 batch_size: int,
                  tensor_parallel_size: Optional[int]):
         """
         Args:
@@ -42,6 +43,7 @@ class VllmBatchInference:
         self.max_model_len = max_model_len
         self.trust_remote_code = trust_remote_code
         self.dtype = dtype
+        self.batch_size = batch_size
 
         num_gpus = torch.cuda.device_count()
         if num_gpus == 0:
@@ -70,6 +72,7 @@ class VllmBatchInference:
             max_model_len=self.max_model_len,
             trust_remote_code=self.trust_remote_code,
             dtype=self.dtype,
+            max_num_seqs=self.batch_size,
         )
 
         # 便利のためにトークナイザも保持しておく
